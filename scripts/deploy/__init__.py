@@ -1,25 +1,31 @@
-import logging
+import os
+from pathlib import Path
 
 import click
 
+from scripts.logging_config import get_logger
 from scripts.tests.post_deploy import test_post_deploy
 from scripts.tests.pre_deployment import test_pre_deploy
-from settings.config import CurveDAOSettings, RollupType, get_chain_settings
+from settings.config import BASE_DIR, get_chain_settings, settings
+from settings.models import RollupType
 
 from .amm.stableswap import deploy_stableswap
 from .amm.tricrypto import deploy_tricrypto
 from .amm.twocrypto import deploy_twocrypto
-from .constants import ADDRESS_PROVIDER_MAPPING, ZERO_ADDRESS
+from .deployment_utils import dump_initial_chain_settings, get_deployment_config, get_deployment_obj
 from .gauge.child_gauge import deploy_liquidity_gauge_infra
-from .governance.xgov import deploy_dao_vault, deploy_xgov
+from .governance.xgov import deploy_dao_vault, deploy_xgov, transfer_ownership
 from .helpers.deposit_and_stake_zap import deploy_deposit_and_stake_zap
 from .helpers.rate_provider import deploy_rate_provider
 from .helpers.router import deploy_router
 from .helpers.stable_swap_meta_zap import deploy_stable_swap_meta_zap
-from .registries.address_provider import deploy_address_provider
+from .models import Pool, Token
+from .registries.address_provider import deploy_address_provider, update_address_provider
 from .registries.metaregistry import deploy_metaregistry, update_metaregistry
+from .test_pools import add_liquidity, deploy_pool, deploy_tokens, swap
+from .test_pools.deploy_pool import deploy_pool
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 @click.group(name="deploy")
@@ -29,202 +35,197 @@ def deploy_commands():
 
 
 @deploy_commands.command("all", short_help="deploy all to chain")
-@click.argument("chain", type=click.STRING)
-def run_deploy_all(chain: str) -> None:
+@click.argument("chain_config_file", type=click.STRING)
+def run_deploy_all(chain_config_file: str) -> None:
 
-    chain_settings = get_chain_settings(chain)
+    # in case we have a few deployed contracts not deployed via curve-core
+    # we will ignore them, e.g. relayer, agent blueprint etc. needed for testing
+    # xgov.
+    ignore_tests = []
+    chain_settings = get_chain_settings(chain_config_file)
     if chain_settings.rollup_type == RollupType.zksync:
         raise NotImplementedError("zksync currently not supported")
+
+    # If we are in debug mode, we want to remove the existing deployment file
+    # so that there are no errors while trying to fetch state from a non-existent forked deployment
+    if settings.DEBUG:
+
+        # create debug filepath
+        debug_filepath = Path(BASE_DIR, "deployments", "debug")
+        if not debug_filepath.exists():
+            os.mkdir(debug_filepath)
+
+        deployment_file_path = Path(BASE_DIR, "deployments", "debug", f"{chain_settings.file_name}.yaml")
+        if deployment_file_path.exists():
+            logger.info(f"Removing existing deployment file {deployment_file_path} for debug deployment")
+            deployment_file_path.unlink()
 
     # pre-deployment tests:
     test_pre_deploy(chain_settings.chain_id)
 
-    if chain_settings.rollup_type == RollupType.not_rollup:
-        logger.info("No xgov for L1, setting temporary owner")
+    # Save chain settings
+    dump_initial_chain_settings(chain_settings)
+
+    # check if there is a need to deploy xgov and vaults
+    if chain_settings.rollup_type == RollupType.not_rollup or (
+        chain_settings.dao.ownership_admin
+        and chain_settings.dao.parameter_admin
+        and chain_settings.dao.emergency_admin
+        and chain_settings.dao.vault
+    ):
+        logger.info("No xgov for L1, setting admins from chain_settings file ...")
         admins = (
             chain_settings.dao.ownership_admin,
             chain_settings.dao.parameter_admin,
             chain_settings.dao.emergency_admin,
         )
         dao_vault = chain_settings.dao.vault
+        ignore_tests.append("xgov")
     else:
+        # deploy xgov and dao vault
         admins = deploy_xgov(chain_settings)
         dao_vault = deploy_dao_vault(chain_settings, admins[0]).address
+
+        # get updated chain settings from deployment file
+        chain_settings = get_deployment_config(chain_settings).config
 
     # Old compatibility
     fee_receiver = dao_vault
 
     # deploy (reward-only) gauge factory and contracts
     child_gauge_factory = deploy_liquidity_gauge_infra(chain_settings)
-    gauge_type = -1  # we set gauge type to -1 until there's an actual gauge type later
-    # TODO: add post_deploy tests for gauge infra
 
     # address provider:
     address_provider = deploy_address_provider(chain_settings)
 
-    # metaregistry:
-    metaregistry = deploy_metaregistry(chain_settings, child_gauge_factory.address, gauge_type)
+    # metaregistry
+    gauge_type = -1  # we set gauge type to -1 until there's an actual gauge type later
+    deploy_metaregistry(chain_settings, child_gauge_factory.address, gauge_type)
 
     # router
-    router = deploy_router(chain_settings)
+    deploy_router(chain_settings)
 
     # deploy amms:
-    stableswap_factory = deploy_stableswap(chain_settings, fee_receiver)
-    tricrypto_factory = deploy_tricrypto(chain_settings, fee_receiver)
-    twocrypto_factory = deploy_twocrypto(chain_settings, fee_receiver)
+    deploy_stableswap(chain_settings, fee_receiver)
+    deploy_tricrypto(chain_settings, fee_receiver)
+    deploy_twocrypto(chain_settings, fee_receiver)
 
     # deposit and stake zap
-    deposit_and_stake_zap = deploy_deposit_and_stake_zap(chain_settings)
+    deploy_deposit_and_stake_zap(chain_settings)
 
     # meta zap
-    stable_swap_meta_zap = deploy_stable_swap_meta_zap(chain_settings)
+    deploy_stable_swap_meta_zap(chain_settings)
 
     # rate provider
-    rate_provider = deploy_rate_provider(chain_settings, address_provider.address)
-
-    # add to the address provider:
-    address_provider_inputs = {
-        2: router.address,
-        4: fee_receiver,
-        7: metaregistry.address,
-        11: tricrypto_factory.address,
-        12: stableswap_factory.address,
-        13: twocrypto_factory.address,
-        18: rate_provider.address,
-        19: chain_settings.dao.crv,  # TODO: update deployment
-        20: child_gauge_factory.address,
-        21: admins[0],
-        22: admins[1],
-        23: admins[2],
-        24: dao_vault,
-        25: chain_settings.dao.crvusd,  # TODO: update deployment
-        26: deposit_and_stake_zap.address,
-        27: stable_swap_meta_zap.address,
-    }
-
-    ids_to_add = []
-    addresses_to_add = []
-    descriptions_to_add = []
-
-    ids_to_update = []
-    for key, value in address_provider_inputs.items():
-
-        # if id is empty:
-        if not address_provider.check_id_exists(key):
-            ids_to_add.append(key)
-            addresses_to_add.append(value)
-            descriptions_to_add.append(ADDRESS_PROVIDER_MAPPING[key])
-
-        elif address_provider.get_address(key).strip().lower() != address_provider_inputs[key].strip().lower():
-            ids_to_update.append(key)
-
-    # add new ids to the address provider
-    logger.info("Updating Address Provider.")
-    if len(ids_to_add) > 0:
-        address_provider.add_new_ids(ids_to_add, addresses_to_add, descriptions_to_add)
-
-    # update existing ids
-    if len(ids_to_update) > 0:
-        for id in ids_to_update:
-            logger.info(f"Updating ID {id} in the Address Provider.")
-            address_provider.update_address(id, address_provider_inputs[id])
+    deploy_rate_provider(chain_settings, address_provider.address)
 
     # update metaregistry
-    update_metaregistry(chain_settings, metaregistry, address_provider)
+    update_metaregistry(chain_settings)
+
+    # update address provider
+    update_address_provider(chain_settings)
 
     # transfer ownership to the dao
-    owner = admins[0]
-
-    # addressprovider
-    current_owner = address_provider._storage.admin.get()
-    if not current_owner == owner:
-        logger.info(f"Current address provider owner: {current_owner}")
-        address_provider.set_owner(owner)
-        logger.info(f"Set address provider owner to {owner}.")
-
-    # metaregistry
-    current_owner = metaregistry._storage.admin.get()
-    if not current_owner == owner:
-        logger.info(f"Current metaregistry owner: {current_owner}")
-        metaregistry.set_owner(owner)
-        logger.info(f"Set metaregistry owner to {owner}.")
-
-    # gauge factory
-    current_owner = child_gauge_factory._storage.owner.get()
-    if not current_owner == owner:
-        logger.info(f"Current liquidity child gauge factory owner: {current_owner}")
-        child_gauge_factory.set_owner(owner)
-        logger.info(f"Set liquidity child gauge factory owner to {owner}.")
-
-    # stableswap
-    current_owner = stableswap_factory._storage.admin.get()
-    if not current_owner == owner:
-        logger.info(f"Current stableswap factory owner: {current_owner}")
-        stableswap_factory.set_owner(owner)
-        logger.info(f"Set stableswap factory owner to {owner}.")
-
-    # tricryptoswap
-    current_owner = tricrypto_factory._storage.admin.get()
-    if not current_owner == owner:
-        logger.info(f"Current tricrypto factory owner: {current_owner}")
-        tricrypto_factory.set_owner(owner)
-        logger.info(f"Set tricrypto factory owner to {owner}.")
-
-    # twocryptoswap
-    current_owner = twocrypto_factory._storage.admin.get()
-    if not current_owner == owner:
-        logger.info(f"Current twocrypto factory owner: {current_owner}")
-        twocrypto_factory.set_owner(owner)
-        logger.info(f"Set twocrypto factory owner to {owner}.")
+    transfer_ownership(chain_settings)
 
     # test post deployment
-    test_post_deploy(chain)
+    test_post_deploy(chain_config_file, ignore_tests)
 
     # final!
     logger.info("Infra deployed and tested!")
 
 
 @deploy_commands.command("governance", short_help="deploy governance")
-@click.argument("chain", type=click.STRING)
-def run_deploy_governance(chain: str) -> None:
-    chain_settings = get_chain_settings(chain)
+@click.argument("chain_config_file", type=click.STRING)
+def run_deploy_governance(chain_config_file: str) -> None:
+    chain_settings = get_chain_settings(chain_config_file)
     admins = deploy_xgov(chain_settings)
     deploy_dao_vault(chain_settings, admins[0])
 
 
 @deploy_commands.command("router", short_help="deploy router")
-@click.argument("chain", type=click.STRING)
-def run_deploy_router(chain: str) -> None:
-    chain_settings = get_chain_settings(chain)
+@click.argument("chain_config_file", type=click.STRING)
+def run_deploy_router(chain_config_file: str) -> None:
+    chain_settings = get_chain_settings(chain_config_file)
     deploy_router(chain_settings)
 
 
 @deploy_commands.command("address_provider", short_help="deploy address provider")
-@click.argument("chain", type=click.STRING)
-def run_deploy_address_provider(chain: str) -> None:
-    chain_settings = get_chain_settings(chain)
+@click.argument("chain_config_file", type=click.STRING)
+def run_deploy_address_provider(chain_config_file: str) -> None:
+    chain_settings = get_chain_settings(chain_config_file)
     deploy_address_provider(chain_settings)
 
 
 @deploy_commands.command("stableswap", short_help="deploy stableswap infra")
-@click.argument("chain", type=click.STRING)
+@click.argument("chain_config_file", type=click.STRING)
 @click.argument("fee_receiver", type=click.STRING)
-def run_deploy_stableswap(chain: str, fee_receiver: str) -> None:
-    chain_settings = get_chain_settings(chain)
+def run_deploy_stableswap(chain_config_file: str, fee_receiver: str) -> None:
+    chain_settings = get_chain_settings(chain_config_file)
     deploy_stableswap(chain_settings, fee_receiver)
 
 
 @deploy_commands.command("tricrypto", short_help="deploy tricrypto infra")
-@click.argument("chain", type=click.STRING)
+@click.argument("chain_config_file", type=click.STRING)
 @click.argument("fee_receiver", type=click.STRING)
-def run_deploy_tricrypto(chain: str, fee_receiver: str) -> None:
-    chain_settings = get_chain_settings(chain)
+def run_deploy_tricrypto(chain_config_file: str, fee_receiver: str) -> None:
+    chain_settings = get_chain_settings(chain_config_file)
     deploy_tricrypto(chain_settings, fee_receiver)
 
 
 @deploy_commands.command("twocrypto", short_help="deploy twocrypto infra")
-@click.argument("chain", type=click.STRING)
+@click.argument("chain_config_file", type=click.STRING)
 @click.argument("fee_receiver", type=click.STRING)
-def run_deploy_twocrypto(chain: str, fee_receiver: str) -> None:
-    chain_settings = get_chain_settings(chain)
+def run_deploy_twocrypto(chain_config_file: str, fee_receiver: str) -> None:
+    chain_settings = get_chain_settings(chain_config_file)
     deploy_twocrypto(chain_settings, fee_receiver)
+
+
+@deploy_commands.command("crypto_pool", short_help="deploy twocrypto pool")
+@click.argument("chain", type=click.STRING)
+@click.argument("name", type=click.STRING)
+@click.argument("symbol", type=click.STRING)
+@click.argument("coins", type=click.STRING)
+def run_deploy_twocrypto(chain: str, name: str, symbol: str, coins: str) -> None:
+    deploy_pool(chain, name, symbol, coins.split(","))
+
+
+@deploy_commands.command("test_tokens", short_help="deploy test tokens and pool on devnet")
+@click.argument("chain", type=click.STRING)
+@click.option("--receiver", default=None, type=click.STRING)
+def run_test_tokens_deployment(chain: str, receiver: str | None = None) -> None:
+    chain_settings = get_chain_settings(f"{chain}.yaml")
+    assert chain_settings.is_testnet, "Only for devnets"
+
+    deployment_file = get_deployment_obj(chain_settings)
+    deployment_config = deployment_file.get_deployment_config()
+    assert deployment_config is not None, "No deployment"
+
+    token0, token1 = deploy_tokens(receiver)
+    tokens = [Token(address=token0.address), Token(address=token1.address)]
+    deployment_config.tokens = tokens
+    deployment_file.update_deployment_config(deployment_config.model_dump())
+
+
+@deploy_commands.command("test_pools", short_help="deploy test tokens and pool on devnet")
+@click.argument("chain", type=click.STRING)
+def run_test_pools_deployment(chain: str) -> None:
+    chain_settings = get_chain_settings(f"{chain}.yaml")
+    assert chain_settings.is_testnet, "Only for devnets"
+
+    deployment_file = get_deployment_obj(chain_settings)
+    deployment_config = deployment_file.get_deployment_config()
+    assert deployment_config is not None, "No deployment"
+
+    token0, token1 = deploy_tokens()
+    tokens = [Token(address=token0.address), Token(address=token1.address)]
+    deployment_config.tokens = tokens
+
+    pool, factory_address = deploy_pool(chain, "Test", "TST", [token0.address, token1.address])
+    deployment_config.pools = [
+        Pool(symbol="TST", address=str(pool.address), factory=str(factory_address), tokens=tokens)
+    ]
+    deployment_file.update_deployment_config(deployment_config.model_dump())
+
+    add_liquidity(pool, token0, token1, 10_000 * 10**18)
+    swap(pool, token0, 1_000 * 10**18)
