@@ -1,10 +1,11 @@
-import logging
 from pathlib import Path
 
-from scripts.deploy.utils import deploy_contract
-from settings.config import BASE_DIR, ChainConfig
+from scripts.deploy.deployment_utils import deploy_contract
+from scripts.logging_config import get_logger
+from settings.config import BASE_DIR
+from settings.models import ChainConfig
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 def deploy_tricrypto(chain_settings: ChainConfig, fee_receiver):
